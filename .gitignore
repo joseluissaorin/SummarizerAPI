@@ -17,3 +17,8 @@ hello.py
 *.python-version.lock
 
 *.log
+test.py
+changelog.md
+codebase-knowledge.md
+
+*.json

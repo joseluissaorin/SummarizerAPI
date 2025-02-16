@@ -1,3 +1,6 @@
+from dotenv import load_dotenv
+load_dotenv()
+
 import asyncio
 import hashlib
 import io
@@ -5,6 +8,7 @@ import json
 import math
 import os
 import re
+import time
 from datetime import datetime
 from pathlib import Path
 from typing import Dict, List, Optional
@@ -26,7 +30,31 @@ PREDEFINED_PERCENTAGES = {
     'long': 0.8
 }
 
+# --- Rate Limiter Implementation ---
+class RateLimiter:
+    def __init__(self, max_calls: int, period: float):
+        """
+        Allows up to max_calls every period (in seconds).
+        """
+        self.max_calls = max_calls
+        self.period = period
+        self.calls = []
+        self.lock = asyncio.Lock()
 
+    async def acquire(self):
+        async with self.lock:
+            now = time.monotonic()
+            # Remove timestamps older than the period
+            self.calls = [t for t in self.calls if now - t < self.period]
+            if len(self.calls) >= self.max_calls:
+                sleep_time = self.period - (now - self.calls[0])
+                await asyncio.sleep(sleep_time)
+            self.calls.append(time.monotonic())
+
+# Global rate limiter: 2000 requests per 60 seconds.
+RATE_LIMITER = RateLimiter(max_calls=500, period=60)
+
+# --- FastAPISummarizer Class ---
 class FastAPISummarizer:
     def __init__(
         self,
@@ -76,12 +104,12 @@ class FastAPISummarizer:
 
         # LLM router – all prompts remain exactly as in the original scripts.
         self.llm_router = LLMRouter(
-            anthropic_api_key=os.getenv("ANTHROPIC_API_KEY", ""),
-            openai_api_key=os.getenv("OPENAI_API_KEY", ""),
-            deepinfra_api_key=os.getenv("DEEPINFRA_API_KEY", ""),
-            gemini_api_key=os.getenv("GEMINI_API_KEY", ""),
-            groq_api_key=os.getenv("GROQ_API_KEY", ""),
-            deepseek_api_key=os.getenv("DEEPSEEK_API_KEY", ""),
+            anthropic_api_key=os.getenv("ANTHROPIC_API_KEY"),
+            openai_api_key=os.getenv("OPENAI_API_KEY"),
+            deepinfra_api_key=os.getenv("DEEPINFRA_API_KEY"),
+            gemini_api_key=os.getenv("GEMINI_API_KEY"),
+            groq_api_key=os.getenv("GROQ_API_KEY"),
+            deepseek_api_key=os.getenv("DEEPSEEK_API_KEY"),
         )
 
         # Attributes for summarization
@@ -102,7 +130,6 @@ class FastAPISummarizer:
     async def summarize(self) -> (str, str):
         # Read and (if needed) transcribe file content
         if self.input_type == "audio":
-            # Use Lemonfox API for transcription
             file_content = await transcribe_audio(self.file_stream, self.lang)
         else:
             file_content = self.file_stream.read().decode("utf-8", errors="replace")
@@ -117,7 +144,7 @@ class FastAPISummarizer:
         if self.caching:
             cached = get_cached_summary(file_hash)
             if cached:
-                return cached.get("sanitized_text", ""), cached.get("dev_text", "")
+                return cached.get("sanitized_text"), cached.get("dev_text")
 
         # Divide text into sections (using the original section dividing logic)
         if self.is_markdown(file_content):
@@ -150,12 +177,9 @@ class FastAPISummarizer:
         previous_summary = ""
         for idx, section in enumerate(batch_sections):
             summary = await self.ask_for_summary(section["content"])
-            # For all but the first section, adjust the beginning for a seamless transition.
             if idx > 0:
                 summary = await self.rewrite_transition(previous_summary, summary)
-            # Capture section tag – if header exists, use it; otherwise use section number.
-            tag = section.get("header", "").strip() or f"Section {idx+1}"
-            # Also store first and last 20 words of the summary for developer info.
+            tag = section.get("header").strip() or f"Section {idx+1}"
             words = summary.split()
             first_20 = " ".join(words[:20])
             last_20 = " ".join(words[-20:])
@@ -169,10 +193,8 @@ class FastAPISummarizer:
         return batch_summaries
 
     async def rewrite_transition(self, prev_summary: str, curr_summary: str) -> str:
-        # Get last 20 words of previous summary and first 20 words of current summary
         prev_context = " ".join(prev_summary.split()[-20:])
         curr_start = " ".join(curr_summary.split()[:20])
-        # Craft the prompt in the same style as original prompts
         prompt = (
             f"Rewrite the following first 20 words of the current section so that it seamlessly follows the previous section. "
             f"Do not change the meaning, just make the transition smooth.\n\n"
@@ -186,6 +208,8 @@ class FastAPISummarizer:
             "Ensure that the rewritten text is seamless and stylistically consistent. "
             "Answer in markdown."
         )
+        # Enforce rate limit before calling LLM.
+        await RATE_LIMITER.acquire()
         rewritten = await self.llm_router.generate(
             model=self.model,
             messages=messages,
@@ -195,18 +219,14 @@ class FastAPISummarizer:
             stop_sequences=["User:", "Human:", "Assistant:"],
             system=system_prompt
         )
-        # Replace the beginning of the current summary with the rewritten text (preserving the rest)
         curr_words = curr_summary.split()
         new_beginning = rewritten.strip()
-        # If the rewritten text does not have 20 words, fallback to original.
         if len(new_beginning.split()) < 15:
             return curr_summary
         new_summary = new_beginning + " " + " ".join(curr_words[20:])
         return new_summary
 
     async def ask_for_summary(self, text: str) -> str:
-        # Instead of using last 200 words context, we do not include them.
-        # We generate a structured outline as in the original.
         structured_outline = await self.generate_structured_outline(text)
         messages = [
             {
@@ -240,7 +260,6 @@ class FastAPISummarizer:
             "that that would be used in academia"
         )
         max_tokens = self.tokens_per_summary * 2 if self.easy else self.tokens_per_summary
-        # Preserve slight randomness as in original
         import random
         max_tokens = int(max_tokens * (1 + (random.uniform(-0.1, 0.1))))
         system_prompt = (
@@ -253,6 +272,8 @@ class FastAPISummarizer:
             f"You must not reference the document. Keep in mind the context if provided and then make a seamless transition and do not repeat yourself if possible. "
             f"You must do all of this in markdown. Remember to answer in {language}. Take a deep breath and think step by step."
         )
+        # Enforce rate limit before calling LLM.
+        await RATE_LIMITER.acquire()
         summary_text = await self.llm_router.generate(
             model=self.model,
             messages=messages,
@@ -265,7 +286,6 @@ class FastAPISummarizer:
         return summary_text
 
     async def generate_structured_outline(self, text: str) -> str:
-        # Use a cache file for outlines (same logic as original)
         first_50_words = ' '.join(text.split()[:50])
         text_hash = hashlib.md5(first_50_words.encode()).hexdigest()
         cache_file = Path("outline_cache.json")
@@ -278,6 +298,8 @@ class FastAPISummarizer:
             return cache[text_hash]
         outline_prompt = f"Generate a brief structured outline for the following text. The outline should capture the main topics and subtopics, providing a clear organization of ideas:\n\n{text}"
         outline_messages = [{"role": "user", "content": outline_prompt}]
+        # Enforce rate limit before calling LLM.
+        await RATE_LIMITER.acquire()
         outline = await self.llm_router.generate(
             model=self.model,
             messages=outline_messages,
