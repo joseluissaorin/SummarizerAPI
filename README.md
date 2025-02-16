@@ -14,6 +14,7 @@ In addition to returning a polished summary ("Sanitized Text"), the API also pro
 ## Table of Contents
 
 - [Features](#features)
+- [Documentation](#documentation)
 - [Endpoints](#endpoints)
 - [Installation](#installation)
 - [Configuration](#configuration)
@@ -34,6 +35,12 @@ In addition to returning a polished summary ("Sanitized Text"), the API also pro
 - **Markdown to DOCX Conversion**: Transforms Markdown files into Word documents (DOCX) and packages them into ZIP files for download.  
 - **Caching**: Optionally caches summarization results based on file content, reducing redundant processing.  
 - **Fully Configurable**: All parameters (input type, summary length, custom percentage, language, style, model, etc.) can be adjusted via form-data fields.
+
+---
+
+## Documentation
+
+For detailed technical documentation, including internal logic, workflow, and comprehensive examples, please refer to our [Technical Documentation](DOCUMENTATION.md).
 
 ---
 
