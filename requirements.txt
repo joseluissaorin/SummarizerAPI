@@ -1,0 +1,12 @@
+fastapi
+uvicorn
+python-dotenv
+httpx
+markdown
+beautifulsoup4
+python-docx
+PyPDF2
+py-zerox
+google-generativeai
+anthropic
+openai
