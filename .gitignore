@@ -22,3 +22,9 @@ changelog.md
 codebase-knowledge.md
 
 *.json
+
+new_summarize.py
+ocr_test.py
+test_section_logic.py
+prueba.md
+old_ocr.py

@@ -153,11 +153,77 @@ class FastAPISummarizer:
             self.sections = [{"header": "", "content": file_content}]
         self.sections = self.adjust_sections(self.sections)
 
+        # --- Begin Adaptive Subdivision Logic from new_summarize.py ---
+        # Calculate the target word count for the summary based on the desired percentage of the original content.
+        target_word_count = int(self.total_word_count * self.target_percentage)
+        
+        # Determine the target number of subdivisions using tokens_per_summary and words_per_token.
+        self.target_subdivisions = max(1, int(target_word_count / (self.tokens_per_summary * self.words_per_token)))
+        
+        # Define an acceptable range of word count with a buffer of 350 words.
+        lower_bound = target_word_count - 350
+        upper_bound = target_word_count + 350
+
+        # Generate subdivisions from each section's content using the subdivide_section helper.
+        all_subdivisions = []
+        for section in self.sections:
+            subdivisions = self.subdivide_section(section['content'])
+            all_subdivisions.extend(subdivisions)
+
+        # If we have more subdivisions than needed, merge them to match the target.
+        if len(all_subdivisions) > self.target_subdivisions:
+            all_subdivisions = self.merge_subdivisions(all_subdivisions, self.target_subdivisions)
+        # If we have too few subdivisions, iteratively split the longest subdivision until reaching the target.
+        elif len(all_subdivisions) < self.target_subdivisions:
+            while len(all_subdivisions) < self.target_subdivisions:
+                longest_idx = max(range(len(all_subdivisions)), key=lambda i: len(all_subdivisions[i].split()))
+                longest_subdivision = all_subdivisions.pop(longest_idx)
+                new_subdivisions = self.subdivide_section(longest_subdivision)
+                if len(new_subdivisions) == 1:  # Cannot subdivide further
+                    all_subdivisions.insert(longest_idx, longest_subdivision)
+                    break
+                all_subdivisions.extend(new_subdivisions)
+
+        # Estimate the combined word count of all subdivisions.
+        estimated_words = self.estimate_summary_length(all_subdivisions, self.target_subdivisions)
+        
+        # If the estimated words are not within the target range, refine subdivisions iteratively.
+        if not (lower_bound <= estimated_words <= upper_bound):
+            iteration = 0
+            max_iterations = 15
+            while iteration < max_iterations:
+                iteration += 1
+                self.summarized_sections = []
+                all_subdivisions = []
+                for section in self.sections:
+                    content = section['content']
+                    # Generate subdivisions from the section
+                    subdivisions = self.subdivide_section(content)
+                    # If subdivisions are too few, reformat the content as a list and subdivide again
+                    if len(subdivisions) < self.target_subdivisions:
+                        formatted_content = self.format_section_as_list(content)
+                        subdivisions = self.subdivide_section(formatted_content)
+                    # Adjust subdivision factor if still under target
+                    while len(subdivisions) < self.target_subdivisions and self.subdivision_factor > 0.1:
+                        self.subdivision_factor *= 0.5
+                        subdivisions = self.subdivide_section(content)
+                    # Merge subdivisions if there are too many
+                    if len(subdivisions) > self.target_subdivisions:
+                        subdivisions = self.merge_subdivisions(subdivisions, self.target_subdivisions)
+                    all_subdivisions.extend(subdivisions)
+                estimated_words = self.estimate_summary_length(all_subdivisions, self.target_subdivisions)
+                if lower_bound <= estimated_words <= upper_bound:
+                    break
+        
+        # Update sections with the final properly sized subdivisions, each becoming a separate section.
+        self.sections = [{"header": "", "content": sub} for sub in all_subdivisions]
+        # --- End Adaptive Subdivision Logic ---
+
         # Process sections in batches of 5
         batched_sections = [self.sections[i:i + 5] for i in range(0, len(self.sections), 5)]
         sanitized_batches = []
         dev_info = {"generated_at": datetime.utcnow().isoformat(), "sections": []}
-
+        
         for batch in batched_sections:
             batch_summaries = await self._summarize_batch(batch)
             sanitized_batches.append(" ".join([sec["content"] for sec in batch_summaries]))
@@ -267,7 +333,7 @@ class FastAPISummarizer:
             f"You will understand the given text and its underlying syntax, which might not be evident. "
             f"You will keep the most essential information and optimize for space, this may include specific names, theories, dates, lists and definitions. "
             f"Follow the provided structured outline to maintain the organization of ideas, you are only talking about the text provided, so you must not mention anything outside of it or in the outline, "
-            f"this is given to you so that you know what not to write about. You must answer in precise and technically perfect Spanish, {easy_to_understand_text}. "
+            f"this is given to you so that you know what not to write about. You must answer in precise and technically perfect {language}, {easy_to_understand_text}. "
             f"You must make no mention to the fact that you are summarizing anything or that you've been given any text but rather you must write the text as one that exists by itself. "
             f"You must not reference the document. Keep in mind the context if provided and then make a seamless transition and do not repeat yourself if possible. "
             f"You must do all of this in markdown. Remember to answer in {language}. Take a deep breath and think step by step."
@@ -368,3 +434,62 @@ class FastAPISummarizer:
         if current_subsection['content']:
             subsections.append(current_subsection)
         return subsections
+
+    # Helper method: subdivide_section
+    def subdivide_section(self, section_content):
+        # Split the content into words
+        words = section_content.split()
+        total_words = len(words)
+        # Determine target chunk size; ensure at least 150 words per chunk
+        target_chunk_size = max(150, total_words // self.target_subdivisions) if self.target_subdivisions else 150
+        subdivisions = []
+        start = 0
+        while start < total_words:
+            end = min(start + target_chunk_size, total_words)
+            # Adjust end to try and land at a sentence boundary (ending with punctuation)
+            while end < total_words and not words[end - 1].endswith(('.', '!', '?')):
+                end += 1
+                if end - start > target_chunk_size * 1.5:  # Prevent overly long segments
+                    break
+            # Join words back into a subdivision string
+            subdivision = ' '.join(words[start:end])
+            subdivisions.append(subdivision)
+            start = end
+        return subdivisions
+
+    # Helper method: merge_subdivisions
+    def merge_subdivisions(self, subdivisions, target_subdivisions):
+        # Calculate the total number of words in all subdivisions
+        total_words = sum(len(s.split()) for s in subdivisions)
+        # Determine optimal merge size per subdivision
+        optimal_merge_size = total_words // target_subdivisions if target_subdivisions > 0 else total_words
+        merged = []
+        temp = []
+        current_words = 0
+        for subdivision in subdivisions:
+            word_count = len(subdivision.split())
+            temp.append(subdivision)
+            current_words += word_count
+            # Once the accumulated words meet the optimal merge size, merge these subdivisions
+            if current_words >= optimal_merge_size:
+                merged.append(" ".join(temp))
+                temp = []
+                current_words = 0
+        if temp:
+            merged.append(" ".join(temp))
+        return merged
+
+    # Helper method: estimate_summary_length
+    def estimate_summary_length(self, subdivisions, target_subdivisions):
+        # Estimate final summary word count assuming each subdivision is condensed to
+        # tokens_per_summary tokens, each token roughly representing words_per_token words.
+        # This gives an estimated summary length of:
+        estimated_words_per_subdivision = self.tokens_per_summary * self.words_per_token
+        return len(subdivisions) * estimated_words_per_subdivision
+
+    # Helper method: format_section_as_list
+    def format_section_as_list(self, text):
+        # Split text into sentences and format as markdown list items
+        sentences = text.split('. ')
+        formatted = "\n".join(f"- {s.strip()}" for s in sentences if s.strip())
+        return formatted

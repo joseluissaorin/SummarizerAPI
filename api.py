@@ -9,6 +9,7 @@ from summarizer_core import FastAPISummarizer
 from lemonfox_whisper import transcribe_audio
 from docx_converter import MarkdownToDocxConverter
 from ocr import get_pdf_page_count, custom_system_prompt  # See ocr.py for details
+from ocr_processor import OCRProcessor  # Import OCRProcessor class
 from pyzerox import zerox  # For OCR processing
 import asyncio
 import glob
@@ -71,8 +72,9 @@ async def transcribe(
 @router.post("/ocr", summary="Perform OCR on a document (PDF/image) using pyzerox")
 async def ocr_endpoint(
     file: UploadFile = File(..., description="PDF or image file to perform OCR on"),
-    model: str = Form("gemini-2.0-flash-lite-preview-02-05", description="Vision model to use for OCR (default: gpt-4o)")
+    model: str = Form("gemini-2.0-flash-lite-preview-02-05", description="Vision model to use for OCR")
 ):
+    tmp_path = None
     try:
         # Save the uploaded file to a temporary file
         suffix = os.path.splitext(file.filename)[1]
@@ -80,54 +82,33 @@ async def ocr_endpoint(
             tmp.write(await file.read())
             tmp_path = tmp.name
 
-        total_pages = get_pdf_page_count(tmp_path)
-        if total_pages == 0:
-            os.remove(tmp_path)
-            raise HTTPException(status_code=400, detail="Failed to read PDF or file has no pages.")
+        # Use the shared OCR processor
+        processor = OCRProcessor(model=model)
+        results = await processor.process_file(tmp_path)
 
-        # Use all pages (1-indexed)
-        select_pages = list(range(1, total_pages + 1))
-        # Create a temporary directory for output
-        output_dir = tempfile.mkdtemp()
-
-        try:
-            # Execute zerox directly since it's already async
-            ocr_result = await zerox(
-                file_path=tmp_path,
-                model=model,
-                output_dir=output_dir,
-                custom_system_prompt=custom_system_prompt,
-                select_pages=select_pages
+        if not results["success"]:
+            raise HTTPException(
+                status_code=500,
+                detail=results["error"] or "OCR processing failed"
             )
 
-            # Now, look for markdown files in the output directory and read their content.
-            md_files = glob.glob(os.path.join(output_dir, "*.md"))
-            ocr_text = ""
-            if md_files:
-                for md_file in md_files:
-                    with open(md_file, "r", encoding="utf-8") as f:
-                        ocr_text += f.read() + "\n"
-            else:
-                # If no markdown files found, fall back to ocr_result (if it contains content)
-                ocr_text = str(ocr_result) if ocr_result else ""
-
-            return JSONResponse(content={"filename": file.filename, "ocr_result": ocr_text})
-        finally:
-            # Clean up temporary files
-            os.remove(tmp_path)
-            # Clean up the output directory and its contents
-            for md_file in glob.glob(os.path.join(output_dir, "*")):
-                try:
-                    os.remove(md_file)
-                except Exception:
-                    pass
-            try:
-                os.rmdir(output_dir)
-            except Exception:
-                pass
+        return JSONResponse(content={
+            "filename": file.filename,
+            "ocr_result": results["text"],
+            "pages_processed": results["pages_processed"],
+            "processing_time": results["processing_time"]
+        })
 
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
+
+    finally:
+        # Clean up temporary input file
+        if tmp_path and os.path.exists(tmp_path):
+            try:
+                os.remove(tmp_path)
+            except Exception:
+                pass
 
 
 @router.post("/convert-markdown-to-docx", summary="Convert a Markdown file to DOCX")
