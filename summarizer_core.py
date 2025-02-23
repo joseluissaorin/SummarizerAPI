@@ -52,7 +52,7 @@ class RateLimiter:
             self.calls.append(time.monotonic())
 
 # Global rate limiter: 2000 requests per 60 seconds.
-RATE_LIMITER = RateLimiter(max_calls=500, period=60)
+RATE_LIMITER = RateLimiter(max_calls=2000, period=60)
 
 # --- FastAPISummarizer Class ---
 class FastAPISummarizer:
@@ -77,6 +77,9 @@ class FastAPISummarizer:
         self.easy = easy
         self.model = model
         self.caching = caching
+
+        # Batch processing configuration
+        self.batch_size = 10
 
         # Always skip repetition evaluation (as per requirements)
         self.skip_repetition = True
@@ -126,6 +129,33 @@ class FastAPISummarizer:
 
         # For developer output – each section will have a tag and boundary info.
         self.dev_sections: List[Dict[str, str]] = []
+
+        # Regex patterns for transition markers
+        self.transition_patterns = [
+            r"(?i)Rewritten\s+beginning\s*:",
+            r"(?i)Rewritten\s+start\s*:",
+            r"(?i)Modified\s+beginning\s*:",
+            r"(?i)New\s+beginning\s*:",
+            r"(?i)Updated\s+beginning\s*:",
+            r"(?i)\*\*Rewritten\s+beginning\*\*\s*:",
+            r"(?i)\*\*Rewritten\s+start\*\*\s*:",
+            r"(?i)\*\*Modified\s+beginning\*\*\s*:",
+            r"(?i)\*\*New\s+beginning\*\*\s*:",
+            r"(?i)\*\*Updated\s+beginning\*\*\s*:",
+            r"(?i)__Rewritten\s+beginning__\s*:",
+            r"(?i)__Rewritten\s+start__\s*:",
+            r"(?i)__Modified\s+beginning__\s*:",
+            r"(?i)__New\s+beginning__\s*:",
+            r"(?i)__Updated\s+beginning__\s*:"
+        ]
+        
+        # Paragraph break markers
+        self.paragraph_markers = [
+            r"\n\n",
+            r"\r\n\r\n",
+            r"\n\s*\n",
+            r"\r\n\s*\r\n"
+        ]
 
     async def summarize(self) -> (str, str):
         # Read and (if needed) transcribe file content
@@ -219,8 +249,8 @@ class FastAPISummarizer:
         self.sections = [{"header": "", "content": sub} for sub in all_subdivisions]
         # --- End Adaptive Subdivision Logic ---
 
-        # Process sections in batches of 5
-        batched_sections = [self.sections[i:i + 5] for i in range(0, len(self.sections), 5)]
+        # Process sections in batches of 10
+        batched_sections = [self.sections[i:i + self.batch_size] for i in range(0, len(self.sections), self.batch_size)]
         sanitized_batches = []
         dev_info = {"generated_at": datetime.utcnow().isoformat(), "sections": []}
         
@@ -239,23 +269,56 @@ class FastAPISummarizer:
         return sanitized_text, dev_text
 
     async def _summarize_batch(self, batch_sections: List[Dict[str, str]]) -> List[Dict[str, str]]:
+        """Process a batch of sections using smart merging strategy."""
         batch_summaries = []
-        previous_summary = ""
+        current_summary = None
+        
         for idx, section in enumerate(batch_sections):
+            # Get summary for current section
             summary = await self.ask_for_summary(section["content"])
-            if idx > 0:
-                summary = await self.rewrite_transition(previous_summary, summary)
-            tag = section.get("header").strip() or f"Section {idx+1}"
-            words = summary.split()
-            first_20 = " ".join(words[:20])
-            last_20 = " ".join(words[-20:])
-            batch_summaries.append({
-                "tag": tag,
-                "content": summary,
-                "first_20_words": first_20,
-                "last_20_words": last_20,
-            })
-            previous_summary = summary
+            summary = self.clean_transition_markers(summary)  # Remove any transition markers
+            
+            if current_summary is None:
+                current_summary = {
+                    "tag": section.get("header").strip() or f"Section {idx+1}",
+                    "content": summary,
+                    "first_20_words": " ".join(summary.split()[:20]),
+                    "last_20_words": " ".join(summary.split()[-20:])
+                }
+            else:
+                # Check if we should merge with previous summary
+                should_merge = await self.should_merge_sections(
+                    current_summary["content"],
+                    summary
+                )
+                
+                if should_merge:
+                    # Merge sections with proper paragraph handling
+                    merged_content = current_summary["content"]
+                    if not any(re.search(marker, merged_content[-10:]) for marker in self.paragraph_markers):
+                        merged_content += "\n\n"  # Add paragraph break if none exists
+                    merged_content += summary
+                    
+                    current_summary = {
+                        "tag": current_summary["tag"],  # Keep the first section's tag
+                        "content": merged_content,
+                        "first_20_words": current_summary["first_20_words"],
+                        "last_20_words": " ".join(summary.split()[-20:])
+                    }
+                else:
+                    # Add current_summary to results and start new one
+                    batch_summaries.append(current_summary)
+                    current_summary = {
+                        "tag": section.get("header").strip() or f"Section {idx+1}",
+                        "content": summary,
+                        "first_20_words": " ".join(summary.split()[:20]),
+                        "last_20_words": " ".join(summary.split()[-20:])
+                    }
+        
+        # Don't forget to add the last summary
+        if current_summary:
+            batch_summaries.append(current_summary)
+            
         return batch_summaries
 
     async def rewrite_transition(self, prev_summary: str, curr_summary: str) -> str:
@@ -493,3 +556,71 @@ class FastAPISummarizer:
         sentences = text.split('. ')
         formatted = "\n".join(f"- {s.strip()}" for s in sentences if s.strip())
         return formatted
+
+    async def check_semantic_similarity(self, text1: str, text2: str) -> float:
+        """
+        Check semantic similarity between two text sections using the LLM.
+        Returns a similarity score between 0 and 1.
+        """
+        prompt = (
+            f"Rate the semantic similarity between these two text sections on a scale from 0 to 1, "
+            f"where 0 means completely unrelated and 1 means highly related. "
+            f"Only respond with a number between 0 and 1.\n\n"
+            f"Text 1: {text1}\n\n"
+            f"Text 2: {text2}"
+        )
+        messages = [{"role": "user", "content": prompt}]
+        
+        await RATE_LIMITER.acquire()
+        response = await self.llm_router.generate(
+            model=self.model,
+            messages=messages,
+            max_tokens=10,
+            temperature=0.1,
+            top_p=0.9,
+            system="You are a helpful assistant that rates semantic similarity between texts."
+        )
+        
+        try:
+            similarity = float(response.strip())
+            return max(0.0, min(1.0, similarity))
+        except (ValueError, TypeError):
+            return 0.5  # Default to medium similarity if parsing fails
+
+    def clean_transition_markers(self, text: str) -> str:
+        """Remove transition markers from the text."""
+        cleaned = text
+        for pattern in self.transition_patterns:
+            cleaned = re.sub(pattern, "", cleaned)
+        return cleaned.strip()
+
+    def get_paragraph_breaks(self, text: str) -> List[int]:
+        """Get indices of paragraph breaks in the text."""
+        breaks = set()
+        for marker in self.paragraph_markers:
+            for match in re.finditer(marker, text):
+                breaks.add(match.start())
+        return sorted(list(breaks))
+
+    async def should_merge_sections(self, prev_section: str, curr_section: str, similarity_threshold: float = 0.7) -> bool:
+        """
+        Determine if two sections should be merged based on:
+        1. Semantic similarity
+        2. Presence of paragraph breaks
+        3. Length considerations
+        """
+        # Don't merge if either section is too long
+        if len(prev_section.split()) > 200 or len(curr_section.split()) > 200:
+            return False
+            
+        # Check for natural paragraph breaks
+        prev_breaks = self.get_paragraph_breaks(prev_section)
+        curr_breaks = self.get_paragraph_breaks(curr_section)
+        
+        # If both sections have multiple paragraph breaks, don't merge
+        if len(prev_breaks) > 1 and len(curr_breaks) > 1:
+            return False
+            
+        # Check semantic similarity
+        similarity = await self.check_semantic_similarity(prev_section, curr_section)
+        return similarity >= similarity_threshold

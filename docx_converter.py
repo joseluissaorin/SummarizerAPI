@@ -7,6 +7,8 @@ from docx.enum.text import WD_ALIGN_PARAGRAPH
 from docx.enum.section import WD_ORIENT
 from docx.shared import RGBColor
 import zipfile
+from docx.oxml import OxmlElement
+from docx.oxml.ns import qn
 
 
 class MarkdownToDocxConverter:
@@ -19,6 +21,58 @@ class MarkdownToDocxConverter:
             os.makedirs(self.output_folder, exist_ok=True)
         except Exception as e:
             raise RuntimeError(f"Failed to create output directory: {e}")
+
+    def _embed_font(self, font_name):
+        """Embed font in the document."""
+        embed = OxmlElement('w:embedRegular')
+        embed.set(qn('w:fontKey'), f"{font_name}_Regular")
+        embed.set(qn('w:subsetted'), "1")
+        return embed
+
+    def _set_document_styles(self):
+        section = self.document.sections[0]
+        section.page_height = Cm(29.7)
+        section.page_width = Cm(21.0)
+        section.top_margin = Cm(2.5)
+        section.bottom_margin = Cm(2.5)
+        section.left_margin = Cm(2.5)
+        section.right_margin = Cm(2.5)
+        section.orientation = WD_ORIENT.PORTRAIT
+        section.different_first_page_header_footer = True
+
+        # Set up normal style with font embedding
+        style = self.document.styles['Normal']
+        font = style.font
+        font.name = 'Fira Sans'
+        font.size = Pt(11)
+        
+        # Add fallback fonts
+        rFonts = font._element.rPr.get_or_add_rFonts()
+        rFonts.set(qn('w:ascii'), 'Fira Sans')
+        rFonts.set(qn('w:hAnsi'), 'Fira Sans')
+        rFonts.set(qn('w:cs'), 'Arial')
+        rFonts.set(qn('w:eastAsia'), 'Arial')
+        
+        # Embed fonts
+        embed_regular = self._embed_font('Fira Sans')
+        font._element.rPr.append(embed_regular)
+
+        # Set up heading styles with font embedding
+        for i in range(1, 10):
+            heading_style = self.document.styles[f'Heading {i}']
+            heading_font = heading_style.font
+            heading_font.name = 'Helvetica'
+            
+            # Add fallback fonts for headings
+            rFonts = heading_font._element.rPr.get_or_add_rFonts()
+            rFonts.set(qn('w:ascii'), 'Helvetica')
+            rFonts.set(qn('w:hAnsi'), 'Helvetica')
+            rFonts.set(qn('w:cs'), 'Arial')
+            rFonts.set(qn('w:eastAsia'), 'Arial')
+            
+            # Embed fonts for headings
+            embed_regular = self._embed_font('Helvetica')
+            heading_font._element.rPr.append(embed_regular)
 
     def convert(self):
         if os.path.isfile(self.input_path):
@@ -43,24 +97,6 @@ class MarkdownToDocxConverter:
         self._add_html_to_document(html)
         self.document.save(output_path)
         self.converted_files.append(output_path)
-
-    def _set_document_styles(self):
-        section = self.document.sections[0]
-        section.page_height = Cm(29.7)
-        section.page_width = Cm(21.0)
-        section.top_margin = Cm(2.5)
-        section.bottom_margin = Cm(2.5)
-        section.left_margin = Cm(2.5)
-        section.right_margin = Cm(2.5)
-        section.orientation = WD_ORIENT.PORTRAIT
-        section.different_first_page_header_footer = True
-        style = self.document.styles['Normal']
-        font = style.font
-        font.name = 'Fira Sans'
-        font.size = Pt(11)
-        for i in range(1, 10):
-            heading_style = self.document.styles[f'Heading {i}']
-            heading_style.font.name = 'Helvetica'
 
     def _add_html_to_document(self, html):
         soup = BeautifulSoup(html, 'html.parser')

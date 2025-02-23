@@ -1,6 +1,7 @@
 import io
 import os
 import tempfile
+import re
 from fastapi import APIRouter, UploadFile, File, Form, HTTPException
 from fastapi.responses import JSONResponse, FileResponse
 from typing import List, Optional
@@ -92,9 +93,12 @@ async def ocr_endpoint(
                 detail=results["error"] or "OCR processing failed"
             )
 
+        # Clean the OCR result by removing ```markdown delimiters
+        cleaned_text = re.sub(r'```markdown\s*|\s*```', '', results["text"])
+
         return JSONResponse(content={
             "filename": file.filename,
-            "ocr_result": results["text"],
+            "ocr_result": cleaned_text,
             "pages_processed": results["pages_processed"],
             "processing_time": results["processing_time"]
         })
