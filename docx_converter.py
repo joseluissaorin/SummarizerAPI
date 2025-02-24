@@ -43,18 +43,18 @@ class MarkdownToDocxConverter:
         # Set up normal style with font embedding
         style = self.document.styles['Normal']
         font = style.font
-        font.name = 'Fira Sans'
+        font.name = 'Helvetica'
         font.size = Pt(11)
         
         # Add fallback fonts
         rFonts = font._element.rPr.get_or_add_rFonts()
-        rFonts.set(qn('w:ascii'), 'Fira Sans')
-        rFonts.set(qn('w:hAnsi'), 'Fira Sans')
+        rFonts.set(qn('w:ascii'), 'Helvetica')
+        rFonts.set(qn('w:hAnsi'), 'Helvetica')
         rFonts.set(qn('w:cs'), 'Arial')
         rFonts.set(qn('w:eastAsia'), 'Arial')
         
         # Embed fonts
-        embed_regular = self._embed_font('Fira Sans')
+        embed_regular = self._embed_font('Helvetica')
         font._element.rPr.append(embed_regular)
 
         # Set up heading styles with font embedding
@@ -119,20 +119,26 @@ class MarkdownToDocxConverter:
                 self._process_inline_elements(element, paragraph)
 
     def _process_inline_elements(self, element, paragraph):
-        for child in element.children:
-            if child.name is None:
-                run = paragraph.add_run(child.string)
-            elif child.name in ['strong', 'b']:
-                run = paragraph.add_run(child.get_text())
+        for node in element.contents:
+            if isinstance(node, str):
+                # Direct text content
+                if node.strip():
+                    paragraph.add_run(node)
+            elif node.name is None and node.string:
+                # NavigableString
+                if node.string.strip():
+                    paragraph.add_run(node.string)
+            elif node.name in ['strong', 'b']:
+                run = paragraph.add_run(node.get_text())
                 run.bold = True
-            elif child.name in ['em', 'i']:
-                run = paragraph.add_run(child.get_text())
+            elif node.name in ['em', 'i']:
+                run = paragraph.add_run(node.get_text())
                 run.italic = True
-            elif child.name == 'u':
-                run = paragraph.add_run(child.get_text())
+            elif node.name == 'u':
+                run = paragraph.add_run(node.get_text())
                 run.underline = True
-            elif child.name == 'a':
-                run = paragraph.add_run(child.get_text())
+            elif node.name == 'a':
+                run = paragraph.add_run(node.get_text())
                 run.underline = True
                 run.font.color.rgb = RGBColor(0, 0, 255)
 
@@ -140,7 +146,36 @@ class MarkdownToDocxConverter:
         for item in list_element.find_all('li', recursive=False):
             style = 'List Number' if is_numbered else 'List Bullet'
             paragraph = self.document.add_paragraph(style=style)
-            self._process_inline_elements(item, paragraph)
+            
+            # Process all content of the list item
+            for node in item.contents:
+                if isinstance(node, str):
+                    # Direct text content
+                    if node.strip():
+                        paragraph.add_run(node)
+                elif node.name is None and node.string:
+                    # NavigableString
+                    if node.string.strip():
+                        paragraph.add_run(node.string)
+                elif node.name == 'p':
+                    # Paragraph inside list item
+                    self._process_inline_elements(node, paragraph)
+                elif node.name in ['strong', 'b']:
+                    run = paragraph.add_run(node.get_text())
+                    run.bold = True
+                elif node.name in ['em', 'i']:
+                    run = paragraph.add_run(node.get_text())
+                    run.italic = True
+                elif node.name == 'u':
+                    run = paragraph.add_run(node.get_text())
+                    run.underline = True
+                elif node.name == 'a':
+                    run = paragraph.add_run(node.get_text())
+                    run.underline = True
+                    run.font.color.rgb = RGBColor(0, 0, 255)
+                elif node.name in ['ul', 'ol']:
+                    # Nested list
+                    self._add_list(node, is_numbered=(node.name == 'ol'))
 
     def _set_first_line_indent(self, paragraph):
         p_fmt = paragraph.paragraph_format

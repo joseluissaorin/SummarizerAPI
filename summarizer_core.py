@@ -326,7 +326,7 @@ class FastAPISummarizer:
         curr_start = " ".join(curr_summary.split()[:20])
         prompt = (
             f"Rewrite the following first 20 words of the current section so that it seamlessly follows the previous section. "
-            f"Do not change the meaning, just make the transition smooth.\n\n"
+            f"Do not add any title, header, or section marker. Do not change the meaning, just make the transition smooth.\n\n"
             f"Previous section ending: {prev_context}\n"
             f"Current section starting: {curr_start}\n\n"
             f"Rewritten beginning (first 20 words):"
@@ -399,6 +399,7 @@ class FastAPISummarizer:
             f"this is given to you so that you know what not to write about. You must answer in precise and technically perfect {language}, {easy_to_understand_text}. "
             f"You must make no mention to the fact that you are summarizing anything or that you've been given any text but rather you must write the text as one that exists by itself. "
             f"You must not reference the document. Keep in mind the context if provided and then make a seamless transition and do not repeat yourself if possible. "
+            f"Do not include titles, headers, or section markers in your summary. Write it as continuous prose. "
             f"You must do all of this in markdown. Remember to answer in {language}. Take a deep breath and think step by step."
         )
         # Enforce rate limit before calling LLM.
