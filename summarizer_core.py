@@ -106,6 +106,7 @@ class FastAPISummarizer:
             self.temperature = 0.95
 
         # LLM router – all prompts remain exactly as in the original scripts.
+        gemini_model_name = self.model if self.model.startswith("gemini") else "gemini-2.0-flash-lite"
         self.llm_router = LLMRouter(
             anthropic_api_key=os.getenv("ANTHROPIC_API_KEY"),
             openai_api_key=os.getenv("OPENAI_API_KEY"),
@@ -113,6 +114,7 @@ class FastAPISummarizer:
             gemini_api_key=os.getenv("GEMINI_API_KEY"),
             groq_api_key=os.getenv("GROQ_API_KEY"),
             deepseek_api_key=os.getenv("DEEPSEEK_API_KEY"),
+            gemini_model_name=gemini_model_name,
         )
 
         # Attributes for summarization
@@ -259,7 +261,8 @@ class FastAPISummarizer:
             sanitized_batches.append(" ".join([sec["content"] for sec in batch_summaries]))
             dev_info["sections"].extend(batch_summaries)
 
-        sanitized_text = "\n\n".join(sanitized_batches)
+        # Apply final verification to ensure text integrity
+        sanitized_text = self.verify_text_integrity("\n\n".join(sanitized_batches))
         dev_text = json.dumps(dev_info, indent=2, ensure_ascii=False)
 
         # If caching is enabled, store result
@@ -270,79 +273,96 @@ class FastAPISummarizer:
 
     async def _summarize_batch(self, batch_sections: List[Dict[str, str]]) -> List[Dict[str, str]]:
         """Process a batch of sections using smart merging strategy."""
-        batch_summaries = []
-        current_summary = None
-        
+        # Primero resumir todas las secciones individualmente
+        individual_summaries = []
         for idx, section in enumerate(batch_sections):
             # Get summary for current section
             summary = await self.ask_for_summary(section["content"])
             summary = self.clean_transition_markers(summary)  # Remove any transition markers
             
-            if current_summary is None:
-                current_summary = {
-                    "tag": section.get("header").strip() or f"Section {idx+1}",
-                    "content": summary,
-                    "first_20_words": " ".join(summary.split()[:20]),
-                    "last_20_words": " ".join(summary.split()[-20:])
-                }
-            else:
-                # Check if we should merge with previous summary
+            individual_summaries.append({
+                "tag": section.get("header").strip() or f"Section {idx+1}",
+                "content": summary,
+                "first_50_words": " ".join(summary.split()[:50]),
+                "last_50_words": " ".join(summary.split()[-50:])
+            })
+        
+        # Luego proceder con la fusión inteligente
+        batch_summaries = []
+        i = 0
+        while i < len(individual_summaries):
+            current = individual_summaries[i]
+            
+            # Mirar adelante para ver si debemos combinar con la siguiente sección
+            if i + 1 < len(individual_summaries):
+                next_section = individual_summaries[i + 1]
                 should_merge = await self.should_merge_sections(
-                    current_summary["content"],
-                    summary
+                    current["content"],
+                    next_section["content"],
+                    similarity_threshold=0.75  # Umbral ligeramente más alto para evitar fusiones incorrectas
                 )
                 
                 if should_merge:
-                    # Merge sections with proper paragraph handling
-                    merged_content = current_summary["content"]
-                    if not any(re.search(marker, merged_content[-10:]) for marker in self.paragraph_markers):
-                        merged_content += "\n\n"  # Add paragraph break if none exists
-                    merged_content += summary
+                    # Reescribir transición
+                    next_content = await self.rewrite_transition(current["content"], next_section["content"])
                     
-                    current_summary = {
-                        "tag": current_summary["tag"],  # Keep the first section's tag
+                    # Combinar secciones con transición adecuada
+                    merged_content = current["content"]
+                    # Asegurarse de que hay un separador de párrafo apropiado
+                    if not re.search(r'\n\n$', merged_content):
+                        merged_content += "\n\n"
+                    merged_content += next_content
+                    
+                    # Actualizar sección actual y saltarse la siguiente
+                    current = {
+                        "tag": current["tag"],
                         "content": merged_content,
-                        "first_20_words": current_summary["first_20_words"],
-                        "last_20_words": " ".join(summary.split()[-20:])
+                        "first_50_words": current["first_50_words"],
+                        "last_50_words": " ".join(next_content.split()[-50:])
                     }
+                    i += 2  # Saltar la siguiente sección
                 else:
-                    # Add current_summary to results and start new one
-                    batch_summaries.append(current_summary)
-                    current_summary = {
-                        "tag": section.get("header").strip() or f"Section {idx+1}",
-                        "content": summary,
-                        "first_20_words": " ".join(summary.split()[:20]),
-                        "last_20_words": " ".join(summary.split()[-20:])
-                    }
-        
-        # Don't forget to add the last summary
-        if current_summary:
-            batch_summaries.append(current_summary)
-            
+                    batch_summaries.append(current)
+                    i += 1
+            else:
+                # Última sección
+                batch_summaries.append(current)
+                i += 1
+                
         return batch_summaries
 
     async def rewrite_transition(self, prev_summary: str, curr_summary: str) -> str:
-        prev_context = " ".join(prev_summary.split()[-20:])
-        curr_start = " ".join(curr_summary.split()[:20])
+        # Usar más contexto del final de la sección anterior y del inicio de la actual
+        prev_context = " ".join(prev_summary.split()[-40:])  # Aumentado de 20 a 40 palabras
+        curr_start = " ".join(curr_summary.split()[:40])     # Aumentado de 20 a 40 palabras
+        
+        language_map = {
+            'en': 'English',
+            'es': 'Spanish',
+            'fr': 'French',
+            'it': 'Italian',
+        }
+        language = language_map.get(self.lang, 'Spanish')
+        
         prompt = (
-            f"Rewrite the following first 20 words of the current section so that it seamlessly follows the previous section. "
+            f"Rewrite the following first 40 words of the current section so that it seamlessly follows the previous section. "
             f"Do not add any title, header, or section marker. Do not change the meaning, just make the transition smooth.\n\n"
             f"Previous section ending: {prev_context}\n"
             f"Current section starting: {curr_start}\n\n"
-            f"Rewritten beginning (first 20 words):"
+            f"Rewritten beginning (in {language}):"
         )
         messages = [{"role": "user", "content": prompt}]
         system_prompt = (
-            "You are a helpful and knowledgeable assistant specialized in summarizing texts. "
-            "Ensure that the rewritten text is seamless and stylistically consistent. "
-            "Answer in markdown."
+            f"You are a helpful and knowledgeable assistant specialized in summarizing texts in {language}. "
+            f"Ensure that the rewritten text is seamless and stylistically consistent. "
+            f"Answer in markdown. Maintain all important information while improving flow."
         )
         # Enforce rate limit before calling LLM.
         await RATE_LIMITER.acquire()
         rewritten = await self.llm_router.generate(
             model=self.model,
             messages=messages,
-            max_tokens=100,
+            max_tokens=150,  # Aumentado para permitir transiciones más completas
             temperature=self.temperature,
             top_p=0.9,
             stop_sequences=["User:", "Human:", "Assistant:"],
@@ -350,13 +370,23 @@ class FastAPISummarizer:
         )
         curr_words = curr_summary.split()
         new_beginning = rewritten.strip()
-        if len(new_beginning.split()) < 15:
+        if len(new_beginning.split()) < 25:  # Asegurarse de que la transición sea sustancial
             return curr_summary
-        new_summary = new_beginning + " " + " ".join(curr_words[20:])
+        
+        # Reemplazar solo el inicio manteniendo el resto intacto
+        new_summary = new_beginning + " " + " ".join(curr_words[40:])
         return new_summary
 
     async def ask_for_summary(self, text: str) -> str:
         structured_outline = await self.generate_structured_outline(text)
+        
+        # Detectar si el texto original contiene listas
+        has_lists = bool(re.search(r'^\s*[-*•]\s+|\s*\d+\.\s+', text, re.MULTILINE))
+        list_instruction = (
+            "Preserve all list structures (numbered lists, bullet points) exactly as they appear in the original text. "
+            "Maintain the hierarchy and complete content of lists even when summarizing other parts."
+        ) if has_lists else ""
+        
         messages = [
             {
                 "role": "user",
@@ -364,7 +394,10 @@ class FastAPISummarizer:
                     f"## Structured Outline: {structured_outline}\n\n"
                     f"## Text to summarize: {text}\n\n"
                     f"## Instructions: Summarize the text above. Maintain the most important information and ensure the summary is substantive. "
-                    f"Do not write lists or numbered items unless they are explicitly written in the given text. Write a cohesive text. Output in markdown."
+                    f"{list_instruction} "
+                    f"Do not write lists or numbered items unless they are explicitly written in the given text. "
+                    f"Do not truncate paragraphs mid-sentence. Ensure each section has a logical conclusion. "
+                    f"Write a cohesive text. Output in markdown."
                 )
             }
         ]
@@ -386,20 +419,50 @@ class FastAPISummarizer:
             "The summary must be a concise summary of the text, the explanation must be a detailed explanation of the text. The summary must be in the same language as the text, "
             "the explanation must be in the same language as the text."
         ) if self.easy else (
-            "that that would be used in academia"
+            "with rigorous academic methodology. Analyze scholarly discourse, maintaining intellectual depth and critical perspective. Explore topics across diverse disciplines, emphasizing systematic research approaches, nuanced interpretation, and interdisciplinary connections. Use precise academic language, structured argumentation, and evidence-based reasoning. Demonstrate intellectual curiosity through comprehensive examination of complex subjects, whether in humanities, sciences, social sciences, or emerging interdisciplinary fields. Prioritize scholarly objectivity while revealing innovative analytical insights."
         )
         max_tokens = self.tokens_per_summary * 2 if self.easy else self.tokens_per_summary
         import random
         max_tokens = int(max_tokens * (1 + (random.uniform(-0.1, 0.1))))
+        
+        # Styling guidelines based on language
+        style_guidelines = ""
+        if language == "Spanish":
+            style_guidelines = (
+                "Use Spanish quotation marks («»). Maintain technical and academic language. Avoid section separation and integrate all elements into a cohesive analysis. "
+                "Avoid both gratuitous praise and unjustified criticism. Avoid overuse of connectors. "
+                "Use long subordinate phrases. Don't include introductions or conclusions in paragraphs or sections—get straight to the point."
+            )
+        elif language == "English":
+            style_guidelines = (
+                "Use English quotation marks. Maintain technical and academic language. Avoid section separation and integrate all elements into a cohesive analysis. "
+                "Avoid both gratuitous praise and unjustified criticism. Use em dashes (—). Avoid overuse of connectors. "
+                "Use long subordinate phrases. Don't include introductions or conclusions in paragraphs or sections—get straight to the point."
+            )
+        elif language == "French":
+            style_guidelines = (
+                "Use French quotation marks («»). Maintain technical and academic language. Avoid section separation and integrate all elements into a cohesive analysis. "
+                "Avoid both gratuitous praise and unjustified criticism. Avoid overuse of connectors. "
+                "Use long subordinate phrases. Don't include introductions or conclusions in paragraphs or sections—get straight to the point."
+            )
+        elif language == "Italian":
+            style_guidelines = (
+                "Use Italian quotation marks («»). Maintain technical and academic language. Avoid section separation and integrate all elements into a cohesive analysis. "
+                "Avoid both gratuitous praise and unjustified criticism. Avoid overuse of connectors. "
+                "Use long subordinate phrases. Don't include introductions or conclusions in paragraphs or sections—get straight to the point."
+            )
+        
         system_prompt = (
             f"You are a helpful and knowledgeable assistant specialized in summarizing texts. "
             f"You will understand the given text and its underlying syntax, which might not be evident. "
             f"You will keep the most essential information and optimize for space, this may include specific names, theories, dates, lists and definitions. "
             f"Follow the provided structured outline to maintain the organization of ideas, you are only talking about the text provided, so you must not mention anything outside of it or in the outline, "
-            f"this is given to you so that you know what not to write about. You must answer in precise and technically perfect {language}, {easy_to_understand_text}. "
+            f"this is given to you so that you know what not to write about. You must answer in precise and technically perfect {language}, {easy_to_understand_text} "
+            f"{style_guidelines}\n\n"
             f"You must make no mention to the fact that you are summarizing anything or that you've been given any text but rather you must write the text as one that exists by itself. "
             f"You must not reference the document. Keep in mind the context if provided and then make a seamless transition and do not repeat yourself if possible. "
-            f"Do not include titles, headers, or section markers in your summary. Write it as continuous prose. "
+            f"Do not include titles, headers, or section markers in your summary. Write it as continuous prose without separating it into distinct parts or sections. "
+            f"Never leave any paragraph, list, or section incomplete. Ensure each section has proper closure. "
             f"You must do all of this in markdown. Remember to answer in {language}. Take a deep breath and think step by step."
         )
         # Enforce rate limit before calling LLM.
@@ -499,27 +562,68 @@ class FastAPISummarizer:
             subsections.append(current_subsection)
         return subsections
 
-    # Helper method: subdivide_section
+    # Versión mejorada para preservar la integridad de los párrafos
     def subdivide_section(self, section_content):
-        # Split the content into words
-        words = section_content.split()
-        total_words = len(words)
-        # Determine target chunk size; ensure at least 150 words per chunk
-        target_chunk_size = max(150, total_words // self.target_subdivisions) if self.target_subdivisions else 150
+        # Dividir primero por párrafos para preservar su integridad
+        paragraphs = re.split(r'(\n\n|\r\n\r\n)', section_content)
+        
         subdivisions = []
-        start = 0
-        while start < total_words:
-            end = min(start + target_chunk_size, total_words)
-            # Adjust end to try and land at a sentence boundary (ending with punctuation)
-            while end < total_words and not words[end - 1].endswith(('.', '!', '?')):
-                end += 1
-                if end - start > target_chunk_size * 1.5:  # Prevent overly long segments
-                    break
-            # Join words back into a subdivision string
-            subdivision = ' '.join(words[start:end])
-            subdivisions.append(subdivision)
-            start = end
-        return subdivisions
+        current_subdivision = ""
+        current_word_count = 0
+        target_word_count = max(150, len(section_content.split()) // self.target_subdivisions) if self.target_subdivisions else 150
+        
+        # Procesar párrafos y sus separadores
+        i = 0
+        while i < len(paragraphs):
+            # Obtener el párrafo y su separador (si existe)
+            paragraph = paragraphs[i]
+            separator = paragraphs[i+1] if i+1 < len(paragraphs) else ""
+            
+            paragraph_word_count = len(paragraph.split())
+            
+            # Si añadir este párrafo excedería mucho el tamaño objetivo, comenzar nueva subdivisión
+            if current_word_count > 0 and current_word_count + paragraph_word_count > target_word_count * 1.5:
+                subdivisions.append(current_subdivision.strip())
+                current_subdivision = ""
+                current_word_count = 0
+            
+            current_subdivision += paragraph + separator
+            current_word_count += paragraph_word_count
+            
+            # Si alcanzamos aproximadamente el tamaño objetivo, finalizar subdivisión
+            if current_word_count >= target_word_count:
+                subdivisions.append(current_subdivision.strip())
+                current_subdivision = ""
+                current_word_count = 0
+            
+            # Avanzar al siguiente par (párrafo + separador)
+            i += 2
+        
+        # Añadir última subdivisión si quedó contenido
+        if current_subdivision:
+            subdivisions.append(current_subdivision.strip())
+        
+        # Verificar si hay listas de elementos y mantenerlas juntas
+        final_subdivisions = []
+        for subdivision in subdivisions:
+            # Detectar si contiene inicios de lista
+            list_items = re.findall(r'^\s*[-*•]\s+|\s*\d+\.\s+', subdivision, re.MULTILINE)
+            
+            if list_items and len(list_items) < 3:  # Si hay pocos elementos, probablemente esté incompleta
+                # Buscar la siguiente subdivisión que podría contener el resto de la lista
+                for i, next_sub in enumerate(subdivisions):
+                    if next_sub != subdivision and re.findall(r'^\s*[-*•]\s+|\s*\d+\.\s+', next_sub, re.MULTILINE):
+                        # Combinar con la siguiente subdivisión que contiene elementos de lista
+                        combined = subdivision + "\n\n" + next_sub
+                        final_subdivisions.append(combined)
+                        subdivisions.remove(next_sub)  # Evitar procesarla de nuevo
+                        break
+                else:
+                    final_subdivisions.append(subdivision)
+            else:
+                final_subdivisions.append(subdivision)
+        
+        return final_subdivisions if final_subdivisions else subdivisions
 
     # Helper method: merge_subdivisions
     def merge_subdivisions(self, subdivisions, target_subdivisions):
@@ -625,3 +729,47 @@ class FastAPISummarizer:
         # Check semantic similarity
         similarity = await self.check_semantic_similarity(prev_section, curr_section)
         return similarity >= similarity_threshold
+    
+    def verify_text_integrity(self, text: str) -> str:
+        """Verifica y corrige problemas de integridad en el texto final."""
+        
+        # Corregir párrafos truncados (terminados abruptamente sin puntuación)
+        paragraphs = text.split('\n\n')
+        for i, paragraph in enumerate(paragraphs):
+            if i < len(paragraphs) - 1 and paragraph and not paragraph.strip().endswith(('.', '!', '?', ':', '"', '»', ')')):
+                # Si el párrafo no termina con puntuación, verificar si el siguiente párrafo 
+                # comienza con minúscula (posible continuación)
+                if paragraphs[i+1] and len(paragraphs[i+1]) > 0 and not paragraphs[i+1][0].isupper():
+                    # Unir con el siguiente párrafo
+                    paragraphs[i] = paragraph + ' ' + paragraphs[i+1]
+                    paragraphs[i+1] = ''
+        
+        # Eliminar párrafos vacíos
+        paragraphs = [p for p in paragraphs if p.strip()]
+        
+        # Restaurar listas fragmentadas
+        processed_paragraphs = []
+        in_list = False
+        current_list = []
+        
+        for paragraph in paragraphs:
+            # Detectar inicio de lista
+            if re.match(r'^\s*[-*•]\s+|\s*\d+\.\s+', paragraph):
+                if not in_list:
+                    in_list = True
+                    current_list = [paragraph]
+                else:
+                    current_list.append(paragraph)
+            else:
+                if in_list:
+                    # Finalizar lista anterior
+                    processed_paragraphs.append('\n'.join(current_list))
+                    in_list = False
+                    current_list = []
+                processed_paragraphs.append(paragraph)
+        
+        # No olvidar la última lista si existe
+        if in_list:
+            processed_paragraphs.append('\n'.join(current_list))
+        
+        return '\n\n'.join(processed_paragraphs)

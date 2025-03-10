@@ -19,6 +19,7 @@ class LLMRouter:
         gemini_api_key: str = None,
         groq_api_key: str = None,
         deepseek_api_key: str = None,
+        gemini_model_name: str = "gemini-2.0-flash-exp",
     ):
         self.anthropic_client = Anthropic(api_key=anthropic_api_key)
         self.openai_client = OpenAI(api_key=openai_api_key)
@@ -28,7 +29,7 @@ class LLMRouter:
         )
         if gemini_api_key:
             genai.configure(api_key=gemini_api_key)
-            self.gemini_model = genai.GenerativeModel("gemini-pro")
+            self.gemini_model = genai.GenerativeModel(gemini_model_name)
         if groq_api_key:
             self.groq_client = OpenAI(
                 api_key=groq_api_key,
