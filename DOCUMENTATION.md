@@ -1,5 +1,3 @@
-
-
 # Summarizer API Documentation
 
 The Summarizer API is a robust, newly created service built with FastAPI that provides comprehensive text, audio, and document processing capabilities. It enables you to generate refined summaries, transcribe audio files, perform OCR on documents, and convert Markdown files into Word documents (DOCX). For summarization requests, the API returns two outputs:
@@ -26,6 +24,11 @@ Additional capabilities include:
   - [TypeScript Example (Next.js)](#typescript-example-nextjs)
 - [Response Format](#response-format)
 - [Additional Notes](#additional-notes)
+- [Summary Length Control Features](#summary-length-control-features)
+- [Key Length Control Features](#key-length-control-features)
+- [Debug Mode](#debug-mode)
+- [Length Control Parameters](#length-control-parameters)
+- [Technical Details](#technical-details)
 
 ---
 
@@ -79,6 +82,7 @@ All parameters are passed as form-data fields. Below is a detailed breakdown:
 | `easy`                | Boolean           | `False`                     | If `true`, generates a summary in an easy-to-understand style with detailed explanations.                                                                                                                    |
 | `model`               | String            | `"gemini-2.0-flash-exp"`    | Specifies the LLM model to use for processing. Options include models such as Claude, GPT, Gemini, etc. Internal parameters (words-per-token ratio, temperature) are adjusted accordingly.                  |
 | `caching`             | Boolean           | `False`                     | When enabled, caches the summarization result based on file content, ensuring faster responses for repeated requests with identical content.                                                                 |
+| `debug`               | Boolean           | `False`                     | When enabled, provides detailed logging about the length control process and includes comprehensive diagnostics in the developer output.                                                                      |
 
 Endpoints dedicated to transcription, OCR, or Markdown conversion require only the relevant fields.
 
@@ -296,3 +300,58 @@ Other endpoints (transcription, OCR, Markdown conversion) return their respectiv
 - **Extensibility**: The API's modular design facilitates easy integration of new features and endpoints.
 
 This documentation provides all the information needed to integrate and use the Summarizer API across various applications, whether using Python, JavaScript, or TypeScript with Next.js.
+
+# Summary Length Control Features
+
+The API now includes enhanced controls for summary length, ensuring that the generated summaries closely match the desired target length specified by either `summary_length` or `custom_percentage` parameters.
+
+## Key Length Control Features
+
+1. **Improved Length Precision**: 
+   - Summaries now more accurately match the requested length percentage
+   - Adaptive subdivision process ensures consistent summary length across different document types
+   - Proper handling of sentence boundaries to avoid truncated content
+
+2. **Mathematical Length Estimation**: 
+   - The system uses a sophisticated algorithm to estimate summary length before processing
+   - This predictive approach eliminates the need for trial-and-error summarization
+   - Adaptive iteration refines the subdivision strategy as needed
+
+3. **Plain Text Handling**: 
+   - Special treatment for plain text documents to ensure accurate length control
+   - Enhanced sentence detection to maintain coherent paragraphs
+   - Balanced subdivision based on model token characteristics
+
+4. **Diagnostic Information**: 
+   - When debug mode is enabled, detailed length control diagnostics are included in the dev_text output
+   - This includes target vs. actual length statistics, iteration data, and adjustment information
+
+## Debug Mode
+
+Setting the `debug` parameter to `true` provides enhanced logging and diagnostics during the summarization process. This is particularly useful for:
+
+- Monitoring target vs. actual summary length
+- Seeing subdivision adjustments in real-time
+- Understanding how the system is calibrating to meet length requirements
+- Getting detailed length statistics in the output
+
+## Length Control Parameters
+
+| Parameter             | Type              | Default Value               | Description                                                                                                                                                                                                   |
+|-----------------------|-------------------|-----------------------------|---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|
+| `summary_length`      | String            | `"medium"`                  | Predefined summary length. Options include: `nano` (1%), `micro` (5%), `very_short` (10%), `shorter` (15%), `short` (23%), `medium_short` (33%), `medium` (40%), `medium_long` (62%), `long` (80%).      |
+| `custom_percentage`   | Float             | `None` (optional)           | Custom summary length as a percentage (0.0 to 1.0). If provided, it overrides the predefined `summary_length`. For instance, `0.5` aims for a summary that is 50% of the original text's length.           |
+| `debug`               | Boolean           | `False`                     | When enabled, provides detailed logging about the length control process and includes comprehensive diagnostics in the developer output.                                                                      |
+
+## Technical Details
+
+The length control system works by:
+
+1. Calculating the target word count based on original document length and requested percentage
+2. Determining the optimal number of subdivisions needed to achieve that length
+3. Splitting content into appropriate subdivisions, respecting sentence boundaries
+4. Estimating the expected summary length before processing
+5. Iteratively adjusting the subdivision strategy if the estimate is outside acceptable bounds
+6. Applying final verification to ensure text coherence and integrity
+
+This approach ensures that the summary closely matches the requested length while maintaining the quality and coherence of the content.

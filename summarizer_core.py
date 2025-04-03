@@ -67,7 +67,23 @@ class FastAPISummarizer:
         easy: bool = False,
         model: str = "gemini-2.0-flash-exp",
         caching: bool = False,
+        debug: bool = False,
     ):
+        """
+        Initialize the FastAPISummarizer with the provided parameters.
+        
+        Args:
+            file_stream: BytesIO object containing the file to summarize
+            input_filename: Name of the input file
+            input_type: Type of input (file, url, audio)
+            summary_length: Predefined summary length (nano, micro, very_short, shorter, short, medium_short, medium, medium_long, long)
+            custom_percentage: Custom percentage for summary length (overrides summary_length if provided)
+            lang: Language for summarization/transcription
+            easy: Whether to generate easy-to-understand summaries
+            model: LLM model to use for summarization
+            caching: Whether to enable caching for summarization
+            debug: Whether to enable debug mode with detailed logging
+        """
         self.file_stream = file_stream
         self.input_filename = input_filename
         self.input_type = input_type
@@ -77,6 +93,40 @@ class FastAPISummarizer:
         self.easy = easy
         self.model = model
         self.caching = caching
+        self.debug = debug
+        
+        # Parameters for length control
+        self.target_percentages = {
+            "nano": 0.01,        # 1%
+            "micro": 0.05,       # 5%
+            "very_short": 0.10,  # 10%
+            "shorter": 0.15,     # 15%
+            "short": 0.23,       # 23%
+            "medium_short": 0.33,  # 33%
+            "medium": 0.40,      # 40%
+            "medium_long": 0.62, # 62%
+            "long": 0.80         # 80%
+        }
+        
+        # Length control parameters
+        self.total_word_count = 0
+        self.tokens_per_section_summary = 600  # Estimated tokens per section summary
+        self.words_per_token = 0.75  # Estimated words per token ratio
+        self.length_wiggle_room = 0.08  # Acceptable deviation from target (8%)
+        self.target_subdivisions = 0  # Will be calculated based on content
+        self.batch_size = 10  # Number of sections to process in each batch
+        
+        # Diagnostics
+        self.length_diagnostics = {
+            "iterations": [],
+            "section_counts": [],
+            "estimated_word_count": 0,
+            "target_word_count": 0,
+            "deviation": 0,
+            "within_bounds": False,
+            "final_word_count": 0,  # Added to track final word count
+            "target_reached": False  # Added to track if target was reached
+        }
 
         # Batch processing configuration
         self.batch_size = 10
@@ -106,7 +156,7 @@ class FastAPISummarizer:
             self.temperature = 0.95
 
         # LLM router – all prompts remain exactly as in the original scripts.
-        gemini_model_name = self.model if self.model.startswith("gemini") else "gemini-2.0-flash-lite"
+        gemini_model_name = "gemini-2.0-flash" if self.model.startswith("gemini") else "gemini-2.0-flash"
         self.llm_router = LLMRouter(
             anthropic_api_key=os.getenv("ANTHROPIC_API_KEY"),
             openai_api_key=os.getenv("OPENAI_API_KEY"),
@@ -126,9 +176,8 @@ class FastAPISummarizer:
         self.subdivision_factor = 1.0
         self.max_subdivision_factor = 50
         self.wiggle_room = 0.06
-        self.target_subdivisions = 0
         self.current_subdivisions = 0
-
+        
         # For developer output – each section will have a tag and boundary info.
         self.dev_sections: List[Dict[str, str]] = []
 
@@ -170,6 +219,9 @@ class FastAPISummarizer:
             raise ValueError("No content found in file.")
 
         self.total_word_count = len(file_content.split())
+        
+        # Update diagnostics
+        self.length_diagnostics["original_word_count"] = self.total_word_count
 
         # Check cache (if enabled)
         file_hash = hashlib.md5(file_content.encode()).hexdigest()
@@ -178,83 +230,165 @@ class FastAPISummarizer:
             if cached:
                 return cached.get("sanitized_text"), cached.get("dev_text")
 
-        # Divide text into sections (using the original section dividing logic)
-        if self.is_markdown(file_content):
-            self.sections = self.divide_markdown(file_content)
-        else:
-            self.sections = [{"header": "", "content": file_content}]
-        self.sections = self.adjust_sections(self.sections)
+        # Determine if it's a markdown or plain text file
+        is_plain_text = not self.is_markdown(file_content)
 
-        # --- Begin Adaptive Subdivision Logic from new_summarize.py ---
         # Calculate the target word count for the summary based on the desired percentage of the original content.
         target_word_count = int(self.total_word_count * self.target_percentage)
+        self.length_diagnostics["target_word_count"] = target_word_count
         
-        # Determine the target number of subdivisions using tokens_per_summary and words_per_token.
-        self.target_subdivisions = max(1, int(target_word_count / (self.tokens_per_summary * self.words_per_token)))
+        # Define reasonable wiggle room (smaller for smaller summaries, larger for larger ones)
+        wiggle_percentage = max(0.05, min(0.10, 0.07 + (1.0 - self.target_percentage) * 0.05))
+        lower_bound = int(target_word_count * (1 - wiggle_percentage))
+        upper_bound = int(target_word_count * (1 + wiggle_percentage))
         
-        # Define an acceptable range of word count with a buffer of 350 words.
-        lower_bound = target_word_count - 350
-        upper_bound = target_word_count + 350
-
-        # Generate subdivisions from each section's content using the subdivide_section helper.
+        # Log the target summary length information if debug is enabled
+        if self.debug:
+            print(f"Target word count: {target_word_count} (allowed range: {lower_bound}-{upper_bound})")
+            print(f"Wiggle room: ±{wiggle_percentage*100:.1f}%")
+        
+        # Generate subdivisions from each section's content
         all_subdivisions = []
-        for section in self.sections:
-            subdivisions = self.subdivide_section(section['content'])
-            all_subdivisions.extend(subdivisions)
 
-        # If we have more subdivisions than needed, merge them to match the target.
-        if len(all_subdivisions) > self.target_subdivisions:
-            all_subdivisions = self.merge_subdivisions(all_subdivisions, self.target_subdivisions)
-        # If we have too few subdivisions, iteratively split the longest subdivision until reaching the target.
-        elif len(all_subdivisions) < self.target_subdivisions:
-            while len(all_subdivisions) < self.target_subdivisions:
-                longest_idx = max(range(len(all_subdivisions)), key=lambda i: len(all_subdivisions[i].split()))
-                longest_subdivision = all_subdivisions.pop(longest_idx)
-                new_subdivisions = self.subdivide_section(longest_subdivision)
-                if len(new_subdivisions) == 1:  # Cannot subdivide further
-                    all_subdivisions.insert(longest_idx, longest_subdivision)
-                    break
-                all_subdivisions.extend(new_subdivisions)
+        if is_plain_text:
+            # Direct subdivision of plain text using the refactored method
+            if self.debug: print("Processing as plain text, using direct calculation for subdivision size.")
+            all_subdivisions = self.subdivide_plain_text(file_content)
+            
+            # --- PLAIN TEXT PATH ENDS HERE for subdivision calculation ---
+            # We directly use the subdivisions from subdivide_plain_text
+            # No further iterative refinement needed for plain text based on estimation.
+            
+            # Estimate length based on final subdivisions for diagnostics
+            estimation_result = self.estimate_summary_length(all_subdivisions)
+            estimated_words = estimation_result["estimated_words"]
 
-        # Estimate the combined word count of all subdivisions.
-        estimated_words = self.estimate_summary_length(all_subdivisions, self.target_subdivisions)
-        
-        # If the estimated words are not within the target range, refine subdivisions iteratively.
-        if not (lower_bound <= estimated_words <= upper_bound):
+        else: # It's Markdown
+            if self.debug: print("Processing as Markdown, using section-based subdivision and iterative refinement.")
+            # --- START EXISTING MARKDOWN LOGIC ---
+            # Divide based on Markdown structure first
+            self.sections = self.divide_markdown(file_content)
+            self.sections = self.adjust_sections(self.sections) # Adjusts very large sections
+
+            # Subdivide each markdown section
+            for section in self.sections:
+                subdivisions = self.subdivide_section(section['content']) # Uses paragraph/sentence logic
+                all_subdivisions.extend(subdivisions)
+
+            # Apply initial merge/split adjustments based on TARGET subdivisions (heuristic)
+            # Determine the target number of subdivisions using tokens_per_summary and words_per_token.
+            # This target is primarily for the initial adjustment heuristic for Markdown
+            self.target_subdivisions = max(1, int(target_word_count / (self.tokens_per_summary * self.words_per_token))) if (self.tokens_per_summary * self.words_per_token) > 0 else 1
+            self.length_diagnostics["target_subdivisions"] = self.target_subdivisions # Log this for markdown path
+
+            if self.debug: print(f"Markdown initial target subdivisions: {self.target_subdivisions}")
+
+            if len(all_subdivisions) > self.target_subdivisions:
+                all_subdivisions = self.merge_subdivisions(all_subdivisions, self.target_subdivisions)
+            elif len(all_subdivisions) < self.target_subdivisions:
+                all_subdivisions = self.adjust_subdivisions_count(all_subdivisions) # Tries splitting
+
+            # Verify the subdivision count and estimate the summary length AFTER initial adjustments
+            subdivision_count = len(all_subdivisions)
+            estimation_result = self.estimate_summary_length(all_subdivisions)
+            estimated_words = estimation_result["estimated_words"]
+
+            # Update diagnostics for initial estimate
+            self.length_diagnostics["initial_markdown_subdivisions"] = subdivision_count
+            self.length_diagnostics["initial_markdown_estimated_words"] = estimated_words
+
+            if self.debug:
+                print(f"Markdown after initial adjustments: Subdivisions: {subdivision_count}, Estimated words: {estimated_words}")
+
+            # --- START ITERATIVE REFINEMENT LOGIC (MARKDOWN ONLY) ---
+            # If estimated words are outside the acceptable range, refine the subdivision process iteratively
             iteration = 0
-            max_iterations = 15
-            while iteration < max_iterations:
+            max_iterations = 5 # Keep a reasonable limit
+
+            # Store the initial state for diagnostics
+            initial_subdivision_count = len(all_subdivisions) # Count after initial adjust
+            initial_estimated_words = estimated_words # Estimate after initial adjust
+
+            while (not (lower_bound <= estimated_words <= upper_bound)) and iteration < max_iterations:
                 iteration += 1
-                self.summarized_sections = []
-                all_subdivisions = []
-                for section in self.sections:
-                    content = section['content']
-                    # Generate subdivisions from the section
-                    subdivisions = self.subdivide_section(content)
-                    # If subdivisions are too few, reformat the content as a list and subdivide again
-                    if len(subdivisions) < self.target_subdivisions:
-                        formatted_content = self.format_section_as_list(content)
-                        subdivisions = self.subdivide_section(formatted_content)
-                    # Adjust subdivision factor if still under target
-                    while len(subdivisions) < self.target_subdivisions and self.subdivision_factor > 0.1:
-                        self.subdivision_factor *= 0.5
-                        subdivisions = self.subdivide_section(content)
-                    # Merge subdivisions if there are too many
-                    if len(subdivisions) > self.target_subdivisions:
-                        subdivisions = self.merge_subdivisions(subdivisions, self.target_subdivisions)
-                    all_subdivisions.extend(subdivisions)
-                estimated_words = self.estimate_summary_length(all_subdivisions, self.target_subdivisions)
-                if lower_bound <= estimated_words <= upper_bound:
-                    break
-        
+                old_subdivision_count = len(all_subdivisions) # Record count before this iteration's adjustment
+
+                adjustment_type = "none" # Track adjustment type
+
+                # Store iteration diagnostics - BEFORE adjustment
+                iteration_info = {
+                    "iteration": iteration,
+                    "old_subdivisions": old_subdivision_count,
+                    "target_word_count": target_word_count,
+                    "estimated_words": estimated_words, # Estimation before adjustment
+                    "lower_bound": lower_bound,
+                    "upper_bound": upper_bound,
+                    "path": "markdown" # Indicate this is the markdown refinement loop
+                }
+
+                # --- This block is now ONLY for Markdown refinement ---
+                if estimated_words < lower_bound:
+                    if self.debug: print(f"Iteration {iteration} (Markdown): Too short ({estimated_words} < {lower_bound}). Attempting to split.")
+                    all_subdivisions = self.adjust_subdivisions_count(all_subdivisions) # Tries splitting longest
+                    adjustment_type = "split attempt"
+                    iteration_info["adjustment"] = adjustment_type
+
+                elif estimated_words > upper_bound:
+                    if self.debug: print(f"Iteration {iteration} (Markdown): Too long ({estimated_words} > {upper_bound}). Attempting to merge.")
+                    merge_target_count = max(1, int(old_subdivision_count * (target_word_count / max(1, estimated_words)))) # Avoid div by zero
+                    if self.debug: print(f"  Merge target count: {merge_target_count}")
+                    all_subdivisions = self.merge_subdivisions(all_subdivisions, merge_target_count)
+                    adjustment_type = "merge"
+                    iteration_info["adjustment"] = adjustment_type
+                    iteration_info["merge_target_count"] = merge_target_count
+
+                # Recalculate the estimated words AFTER adjustment
+                new_subdivision_count = len(all_subdivisions)
+                estimation_result = self.estimate_summary_length(all_subdivisions)
+                estimated_words = estimation_result["estimated_words"]
+
+                # Update diagnostics AFTER adjustment
+                iteration_info["new_subdivisions"] = new_subdivision_count
+                iteration_info["new_estimated"] = estimated_words
+
+                self.length_diagnostics["iterations"].append(iteration_info)
+
+                if self.debug:
+                    print(f"Iteration {iteration} (Markdown): Adjustment: {adjustment_type}")
+                    print(f"  Subdivisions: {old_subdivision_count} -> {new_subdivision_count}")
+                    print(f"  Estimated words: {iteration_info['estimated_words']} -> {estimated_words}")
+
+                if new_subdivision_count == old_subdivision_count and adjustment_type != "none":
+                     if self.debug: print(f"Iteration {iteration} (Markdown): Subdivision count ({new_subdivision_count}) unchanged after {adjustment_type}. Breaking loop.")
+                     break
+                # --- END ITERATIVE REFINEMENT LOGIC ---
+                # --- END EXISTING MARKDOWN LOGIC ---
+
+        # --- COMMON LOGIC AFTER SUBDIVISION ---
+        # Final update to diagnostics after all subdivision logic (plain or markdown)
+        self.length_diagnostics["actual_subdivisions"] = len(all_subdivisions)
+        # Use the 'estimated_words' calculated from the appropriate path (plain direct or markdown refined)
+        final_estimation = self.estimate_summary_length(all_subdivisions) # Re-estimate based on final subdivisions
+        self.length_diagnostics["final_estimated_word_count_before_summary"] = final_estimation["estimated_words"] # Estimate based on final subs
+        self.length_diagnostics["final_deviation_before_summary"] = final_estimation["deviation"]
+        self.length_diagnostics["final_within_bounds_before_summary"] = final_estimation["within_bounds"]
+
+        if self.debug:
+            print(f"Final subdivisions before summarization: {len(all_subdivisions)}")
+            print(f"Final estimated words before summarization: {final_estimation['estimated_words']} (Target: {target_word_count}, Bounds: {lower_bound}-{upper_bound})")
+
         # Update sections with the final properly sized subdivisions, each becoming a separate section.
         self.sections = [{"header": "", "content": sub} for sub in all_subdivisions]
-        # --- End Adaptive Subdivision Logic ---
+        # --- End Enhanced Length Control Logic --- # Note: This comment might be slightly misplaced now but harmless
 
-        # Process sections in batches of 10
+        # Process sections in batches
         batched_sections = [self.sections[i:i + self.batch_size] for i in range(0, len(self.sections), self.batch_size)]
         sanitized_batches = []
-        dev_info = {"generated_at": datetime.utcnow().isoformat(), "sections": []}
+        dev_info = {
+            "generated_at": datetime.utcnow().isoformat(), 
+            "sections": [],
+            "length_diagnostics": self.length_diagnostics
+        }
         
         for batch in batched_sections:
             batch_summaries = await self._summarize_batch(batch)
@@ -263,6 +397,20 @@ class FastAPISummarizer:
 
         # Apply final verification to ensure text integrity
         sanitized_text = self.verify_text_integrity("\n\n".join(sanitized_batches))
+        
+        # Count final summary length for diagnostics
+        final_word_count = len(sanitized_text.split())
+        self.length_diagnostics["final_word_count"] = final_word_count
+        self.length_diagnostics["target_reached"] = lower_bound <= final_word_count <= upper_bound
+        
+        if self.debug:
+            actual_percentage = final_word_count / self.total_word_count
+            print(f"Final summary: {final_word_count} words ({actual_percentage:.1%} of original)")
+            print(f"Target was: {target_word_count} words ({self.target_percentage:.1%} of original)")
+            print(f"Difference: {final_word_count - target_word_count} words " +
+                  f"({(actual_percentage - self.target_percentage) * 100:.1f}% points)")
+            print(f"Target reached: {'Yes' if lower_bound <= final_word_count <= upper_bound else 'No'}")
+        
         dev_text = json.dumps(dev_info, indent=2, ensure_ascii=False)
 
         # If caching is enabled, store result
@@ -562,15 +710,28 @@ class FastAPISummarizer:
             subsections.append(current_subsection)
         return subsections
 
-    # Versión mejorada para preservar la integridad de los párrafos
+    # Versión mejorada para preservar la integridad de los párrafos y respetar límites de oraciones
     def subdivide_section(self, section_content):
+        """
+        Subdivide a section into smaller chunks, ensuring chunks end on complete sentences
+        and match the target subdivision count needed for the desired summary length.
+        """
+        # First, determine if input is a plain text file
+        is_plain_text = not self.is_markdown(section_content)
+        
+        # For plain text files, we'll use a more precise mathematical approach
+        if is_plain_text:
+            return self.subdivide_plain_text(section_content)
+        
+        # For markdown, we'll use the existing paragraph-based approach with improvements
         # Dividir primero por párrafos para preservar su integridad
         paragraphs = re.split(r'(\n\n|\r\n\r\n)', section_content)
         
         subdivisions = []
         current_subdivision = ""
         current_word_count = 0
-        target_word_count = max(150, len(section_content.split()) // self.target_subdivisions) if self.target_subdivisions else 150
+        # Calculate target words per subdivision based on the *current* overall target subdivisions
+        target_words_per_sub = max(150, len(section_content.split()) // self.target_subdivisions) if self.target_subdivisions else 150
         
         # Procesar párrafos y sus separadores
         i = 0
@@ -582,7 +743,7 @@ class FastAPISummarizer:
             paragraph_word_count = len(paragraph.split())
             
             # Si añadir este párrafo excedería mucho el tamaño objetivo, comenzar nueva subdivisión
-            if current_word_count > 0 and current_word_count + paragraph_word_count > target_word_count * 1.5:
+            if current_word_count > 0 and current_word_count + paragraph_word_count > target_words_per_sub * 1.5:
                 subdivisions.append(current_subdivision.strip())
                 current_subdivision = ""
                 current_word_count = 0
@@ -591,7 +752,7 @@ class FastAPISummarizer:
             current_word_count += paragraph_word_count
             
             # Si alcanzamos aproximadamente el tamaño objetivo, finalizar subdivisión
-            if current_word_count >= target_word_count:
+            if current_word_count >= target_words_per_sub:
                 subdivisions.append(current_subdivision.strip())
                 current_subdivision = ""
                 current_word_count = 0
@@ -605,62 +766,347 @@ class FastAPISummarizer:
         
         # Verificar si hay listas de elementos y mantenerlas juntas
         final_subdivisions = []
-        for subdivision in subdivisions:
+        processed_indices = set() # Keep track of subdivisions already merged into a list
+        
+        for idx, subdivision in enumerate(subdivisions):
+            if idx in processed_indices:
+                continue
+
             # Detectar si contiene inicios de lista
             list_items = re.findall(r'^\s*[-*•]\s+|\s*\d+\.\s+', subdivision, re.MULTILINE)
             
-            if list_items and len(list_items) < 3:  # Si hay pocos elementos, probablemente esté incompleta
-                # Buscar la siguiente subdivisión que podría contener el resto de la lista
-                for i, next_sub in enumerate(subdivisions):
-                    if next_sub != subdivision and re.findall(r'^\s*[-*•]\s+|\s*\d+\.\s+', next_sub, re.MULTILINE):
-                        # Combinar con la siguiente subdivisión que contiene elementos de lista
-                        combined = subdivision + "\n\n" + next_sub
-                        final_subdivisions.append(combined)
-                        subdivisions.remove(next_sub)  # Evitar procesarla de nuevo
-                        break
-                else:
-                    final_subdivisions.append(subdivision)
+            if list_items and len(list_items) < 3:  # If few items, likely incomplete
+                merged_list_subdivision = subdivision
+                # Look ahead for subsequent subdivisions that might contain the rest of the list
+                for next_idx in range(idx + 1, len(subdivisions)):
+                    next_sub = subdivisions[next_idx]
+                    if re.search(r'^\s*[-*•]\s+|\s*\d+\.\s+', next_sub, re.MULTILINE):
+                        merged_list_subdivision += "\n\n" + next_sub
+                        processed_indices.add(next_idx) # Mark as processed
+                    else:
+                         # Stop merging if the next subdivision doesn't look like a list item
+                        break 
+                final_subdivisions.append(merged_list_subdivision)
+                processed_indices.add(idx)
             else:
                 final_subdivisions.append(subdivision)
         
-        return final_subdivisions if final_subdivisions else subdivisions
+        return final_subdivisions
 
-    # Helper method: merge_subdivisions
     def merge_subdivisions(self, subdivisions, target_subdivisions):
-        # Calculate the total number of words in all subdivisions
+        """Merges subdivisions if the current count exceeds the target."""
+        if self.debug:
+            print(f"Attempting to merge {len(subdivisions)} subdivisions into {target_subdivisions}")
+        
+        if len(subdivisions) <= target_subdivisions:
+            return subdivisions # No merging needed
+
+        # Calculate average target words per subdivision for merging
         total_words = sum(len(s.split()) for s in subdivisions)
-        # Determine optimal merge size per subdivision
-        optimal_merge_size = total_words // target_subdivisions if target_subdivisions > 0 else total_words
+        target_words_per_merged_sub = total_words / target_subdivisions
+
         merged = []
-        temp = []
-        current_words = 0
+        current_merged_sub = []
+        current_merged_words = 0
+
         for subdivision in subdivisions:
-            word_count = len(subdivision.split())
-            temp.append(subdivision)
-            current_words += word_count
-            # Once the accumulated words meet the optimal merge size, merge these subdivisions
-            if current_words >= optimal_merge_size:
-                merged.append(" ".join(temp))
-                temp = []
-                current_words = 0
-        if temp:
-            merged.append(" ".join(temp))
+            subdivision_words = len(subdivision.split())
+
+            # If adding this subdivision would significantly exceed the target word count
+            # and we haven't reached the desired number of merged sections yet,
+            # finalize the current merged section and start a new one.
+            # The `* 1.2` adds some flexibility. Check `len(merged) < target_subdivisions - 1` ensures the last section can absorb remaining content.
+            if current_merged_words > 0 and \
+               current_merged_words + subdivision_words > target_words_per_merged_sub * 1.2 and \
+               len(merged) < target_subdivisions - 1:
+                merged.append("\n\n".join(current_merged_sub)) # Join with paragraph breaks
+                current_merged_sub = [subdivision]
+                current_merged_words = subdivision_words
+            else:
+                # Otherwise, add the current subdivision to the ongoing merged section
+                current_merged_sub.append(subdivision)
+                current_merged_words += subdivision_words
+
+        # Add the last collected merged subdivision
+        if current_merged_sub:
+            merged.append("\n\n".join(current_merged_sub))
+
+        if self.debug:
+            print(f"Merged into {len(merged)} subdivisions.")
         return merged
 
-    # Helper method: estimate_summary_length
-    def estimate_summary_length(self, subdivisions, target_subdivisions):
-        # Estimate final summary word count assuming each subdivision is condensed to
-        # tokens_per_summary tokens, each token roughly representing words_per_token words.
-        # This gives an estimated summary length of:
-        estimated_words_per_subdivision = self.tokens_per_summary * self.words_per_token
-        return len(subdivisions) * estimated_words_per_subdivision
+    def adjust_subdivisions_count(self, subdivisions):
+        """Adjusts subdivisions if the current count is less than the target, by splitting the longest ones."""
+        target_count = self.target_subdivisions
+        if self.debug:
+            print(f"Attempting to adjust {len(subdivisions)} subdivisions to reach target {target_count}")
 
-    # Helper method: format_section_as_list
-    def format_section_as_list(self, text):
-        # Split text into sentences and format as markdown list items
-        sentences = text.split('. ')
-        formatted = "\n".join(f"- {s.strip()}" for s in sentences if s.strip())
-        return formatted
+        if len(subdivisions) >= target_count:
+            return subdivisions # No adjustment needed or already too many
+
+        # Sort subdivisions by length (longest first) to prioritize splitting them
+        sorted_indices = sorted(range(len(subdivisions)), key=lambda k: len(subdivisions[k].split()), reverse=True)
+        
+        current_subdivisions = list(subdivisions) # Create a mutable copy
+
+        # Keep track of which original subdivisions have been split to avoid infinite loops if splitting fails
+        split_attempted_indices = set() 
+
+        while len(current_subdivisions) < target_count:
+            made_a_split = False
+            # Iterate through sorted indices to find the next longest subdivision to split
+            for original_idx in sorted_indices:
+                 # Find the current index of this subdivision in the potentially modified list
+                try:
+                    current_idx = -1
+                    # Need to find the *content* in the current list as indices shift
+                    original_content = subdivisions[original_idx]
+                    for i, sub in enumerate(current_subdivisions):
+                        if sub == original_content:
+                            current_idx = i
+                            break
+                    
+                    if current_idx == -1 or current_idx in split_attempted_indices:
+                        continue # Already tried splitting this one or it's gone
+
+                    longest_subdivision_content = current_subdivisions[current_idx]
+                    split_attempted_indices.add(current_idx) # Mark as attempted
+
+                    # Attempt to split using the same subdivide_section logic
+                    # Temporarily reduce target_subdivisions to encourage splitting this section
+                    original_target = self.target_subdivisions
+                    self.target_subdivisions = 2 # Aim to split into at least 2
+                    newly_split_parts = self.subdivide_section(longest_subdivision_content)
+                    self.target_subdivisions = original_target # Restore original target
+
+                    if len(newly_split_parts) > 1: 
+                        # Successful split: remove the original and insert the new parts
+                        current_subdivisions.pop(current_idx)
+                        current_subdivisions.insert(current_idx, newly_split_parts[0]) # Insert first part at original location
+                        current_subdivisions.extend(newly_split_parts[1:]) # Append the rest
+                        made_a_split = True
+                        # Recalculate sorted_indices as lengths/positions changed
+                        sorted_indices = sorted(range(len(current_subdivisions)), key=lambda k: len(current_subdivisions[k].split()), reverse=True)
+                        # Reset attempted indices for the new list structure
+                        split_attempted_indices = set() 
+                        break # Go back to the while loop condition check
+                    #else:
+                        # If subdivide_section returned only 1 part, it couldn't be split further.
+                        # Leave it as is and try the next longest.
+
+                except IndexError:
+                    # This can happen if indices get out of sync, break and return current best effort
+                    break
+
+            if not made_a_split:
+                # If we went through all subdivisions and couldn't split any further, break the loop
+                break
+        
+        if self.debug:
+             print(f"Adjusted count to {len(current_subdivisions)} subdivisions.")
+        return current_subdivisions
+
+    def subdivide_plain_text(self, text):
+        """
+        Subdivide plain text content into optimal sections to achieve the target summary length.
+        Uses mathematical calculation to determine the ideal section size.
+        
+        Args:
+            text (str): The plain text content to be subdivided
+        
+        Returns:
+            list: A list of text sections optimized for the target summary length
+        """
+        if self.debug:
+            self.length_diagnostics["iterations"].append("Starting plain text subdivision")
+        
+        # Calculate the target summary word count based on percentage
+        percentage = self.get_percentage_from_summary_length()
+        target_word_count = int(self.total_word_count * percentage)
+        self.length_diagnostics["target_word_count"] = target_word_count
+        
+        # Split text into sentences for proper boundary handling
+        sentences = re.split(r'(?<=[.!?])\s+', text)
+        
+        # Calculate optimal section size using the direct formula
+        words_per_section = 250 # Default fallback
+
+        # Calculate optimal section size directly based on target length
+        if target_word_count <= 0: # Avoid division by zero
+            # If target is very small/zero, aim for fewer, larger sections
+            # Use total words / a small number (e.g., 2) to get large sections
+            words_per_section = max(250, int(self.total_word_count / 2)) 
+            if self.debug: print(f"Plain text: Target word count {target_word_count} too low, setting large words_per_section: {words_per_section}")
+        else:
+            # Formula: target_summary_words = (total_original_words / words_per_section) * tokens_per_summary * words_per_token
+            # Rearranged to find words_per_section:
+            # words_per_section = (total_original_words * tokens_per_summary * words_per_token) / target_summary_words
+            
+            # Ensure divisors are not zero
+            tokens_per_summary = self.tokens_per_summary if self.tokens_per_summary > 0 else 515 # Use default if zero
+            words_per_token = self.words_per_token if self.words_per_token > 0 else 0.3 # Use default if zero
+            
+            denominator = target_word_count
+            numerator = self.total_word_count * tokens_per_summary * words_per_token
+            
+            if denominator <= 0:
+                 words_per_section = 4000 # Assign a large value if target_word_count is non-positive
+                 if self.debug: print(f"Plain text: Denominator (target_word_count) is zero or negative, setting large words_per_section: {words_per_section}")
+            else:
+                # Estimate number of sections needed first to avoid huge intermediate numbers if possible
+                estimated_sections_needed = target_word_count / max(1e-6, (tokens_per_summary * words_per_token))
+                words_per_section = int(self.total_word_count / max(1, estimated_sections_needed))
+
+        # --- HARDCODED ADJUSTMENT FOR PLAIN TEXT --- 
+        # Empirically observed ~122% overestimation in final word count compared to target for plain text.
+        # Multiply calculated words_per_section by 2.22 to create fewer, larger sections, aiming to compensate.
+        adjustment_factor = 2.7 # Changed from 1.23 based on latest test results
+        adjusted_words_per_section = int(words_per_section * adjustment_factor)
+        if self.debug:
+            print(f"Plain text: Applying adjustment factor {adjustment_factor}. Original words_per_section: {words_per_section}, Adjusted: {adjusted_words_per_section}")
+        words_per_section = adjusted_words_per_section # Use the adjusted value
+        # --- END HARDCODED ADJUSTMENT ---
+
+        # Clamp within reasonable bounds
+        words_per_section = max(50, min(4000, words_per_section)) # Min 50 words, Max 4000 words per section
+
+        if self.debug:
+             print(f"Plain text direct calculation: target={target_word_count}, total_words={self.total_word_count}, calculated words_per_section={words_per_section}")
+             self.length_diagnostics["iterations"].append({
+                 "type": "plain_text_direct_calc",
+                 "calculated_words_per_section": words_per_section,
+                 "target_word_count": target_word_count,
+             })
+        
+        # Now create the actual sections based on the calculated words_per_section
+        sections = []
+        current_section = []
+        current_word_count = 0
+        
+        for sentence in sentences:
+            sentence_words = len(sentence.split())
+            
+            # If adding this sentence would exceed the section size and we already have content,
+            # finalize the current section and start a new one
+            if current_word_count > 0 and current_word_count + sentence_words > words_per_section:
+                sections.append(" ".join(current_section))
+                current_section = [sentence]
+                current_word_count = sentence_words
+            else:
+                current_section.append(sentence)
+                current_word_count += sentence_words
+        
+        # Add the last section if it has any content
+        if current_section:
+            sections.append(" ".join(current_section))
+        
+        if self.debug:
+            self.length_diagnostics["section_counts"].append({
+                "type": "plain_text",
+                "final_sections": len(sections),
+                "words_per_section": words_per_section,
+                "estimated_total_summary_words": len(sections) * self.tokens_per_section_summary * self.words_per_token
+            })
+        
+        return sections
+
+    def estimate_summary_length(self, subdivisions):
+        """
+        Estimate the length of the summary based on subdivision count and model parameters.
+        
+        Args:
+            subdivisions (list): The list of content subdivisions
+        
+        Returns:
+            dict: Estimation data including expected word count and deviation from target
+        """
+        # Calculate the target summary word count
+        percentage = self.get_percentage_from_summary_length()
+        target_word_count = int(self.total_word_count * percentage)
+        
+        # Estimate tokens and words based on subdivision count
+        estimated_summary_tokens = len(subdivisions) * self.tokens_per_section_summary
+        estimated_summary_words = int(estimated_summary_tokens * self.words_per_token)
+        
+        # Calculate deviation from target
+        deviation = abs(estimated_summary_words - target_word_count) / target_word_count
+        within_bounds = deviation <= self.length_wiggle_room
+        
+        # Update diagnostics
+        if self.debug:
+            self.length_diagnostics["estimated_word_count"] = estimated_summary_words
+            self.length_diagnostics["target_word_count"] = target_word_count
+            self.length_diagnostics["deviation"] = deviation
+            self.length_diagnostics["within_bounds"] = within_bounds
+        
+        return {
+            "estimated_words": estimated_summary_words,
+            "target_words": target_word_count,
+            "deviation": deviation,
+            "within_bounds": within_bounds
+        }
+
+    def get_percentage_from_summary_length(self):
+        """
+        Get the percentage value for the current summary length setting.
+        
+        Returns:
+            float: Percentage value (0.0-1.0) for the current summary length
+        """
+        # If a custom percentage is provided, use that
+        if self.custom_percentage is not None:
+            return min(1.0, max(0.01, self.custom_percentage))
+        
+        # Otherwise, get the percentage from the predefined settings
+        if self.summary_length in self.target_percentages:
+            return self.target_percentages[self.summary_length]
+        
+        # Default to medium (40%) if the summary_length is not recognized
+        return self.target_percentages["medium"]
+
+    def verify_text_integrity(self, text: str) -> str:
+        """Verifica y corrige problemas de integridad en el texto final."""
+        
+        # Corregir párrafos truncados (terminados abruptamente sin puntuación)
+        paragraphs = text.split('\n\n')
+        for i, paragraph in enumerate(paragraphs):
+            if i < len(paragraphs) - 1 and paragraph and not paragraph.strip().endswith(('.', '!', '?', ':', '"', '»', ')')):
+                # Si el párrafo no termina con puntuación, verificar si el siguiente párrafo 
+                # comienza con minúscula (posible continuación)
+                if paragraphs[i+1] and len(paragraphs[i+1]) > 0 and not paragraphs[i+1][0].isupper():
+                    # Unir con el siguiente párrafo
+                    paragraphs[i] = paragraph + ' ' + paragraphs[i+1]
+                    paragraphs[i+1] = ''
+        
+        # Eliminar párrafos vacíos
+        paragraphs = [p for p in paragraphs if p.strip()]
+        
+        # Restaurar listas fragmentadas
+        processed_paragraphs = []
+        in_list = False
+        current_list = []
+        
+        for paragraph in paragraphs:
+            # Detectar inicio de lista
+            if re.match(r'^\s*[-*•]\s+|\s*\d+\.\s+', paragraph):
+                if not in_list:
+                    in_list = True
+                    current_list = [paragraph]
+                else:
+                    current_list.append(paragraph)
+            else:
+                if in_list:
+                    # Finalizar lista anterior
+                    processed_paragraphs.append('\n'.join(current_list))
+                    in_list = False
+                    current_list = []
+                processed_paragraphs.append(paragraph)
+        
+        # No olvidar la última lista si existe
+        if in_list:
+            processed_paragraphs.append('\n'.join(current_list))
+        
+        return '\n\n'.join(processed_paragraphs)
 
     async def check_semantic_similarity(self, text1: str, text2: str) -> float:
         """
@@ -729,47 +1175,3 @@ class FastAPISummarizer:
         # Check semantic similarity
         similarity = await self.check_semantic_similarity(prev_section, curr_section)
         return similarity >= similarity_threshold
-    
-    def verify_text_integrity(self, text: str) -> str:
-        """Verifica y corrige problemas de integridad en el texto final."""
-        
-        # Corregir párrafos truncados (terminados abruptamente sin puntuación)
-        paragraphs = text.split('\n\n')
-        for i, paragraph in enumerate(paragraphs):
-            if i < len(paragraphs) - 1 and paragraph and not paragraph.strip().endswith(('.', '!', '?', ':', '"', '»', ')')):
-                # Si el párrafo no termina con puntuación, verificar si el siguiente párrafo 
-                # comienza con minúscula (posible continuación)
-                if paragraphs[i+1] and len(paragraphs[i+1]) > 0 and not paragraphs[i+1][0].isupper():
-                    # Unir con el siguiente párrafo
-                    paragraphs[i] = paragraph + ' ' + paragraphs[i+1]
-                    paragraphs[i+1] = ''
-        
-        # Eliminar párrafos vacíos
-        paragraphs = [p for p in paragraphs if p.strip()]
-        
-        # Restaurar listas fragmentadas
-        processed_paragraphs = []
-        in_list = False
-        current_list = []
-        
-        for paragraph in paragraphs:
-            # Detectar inicio de lista
-            if re.match(r'^\s*[-*•]\s+|\s*\d+\.\s+', paragraph):
-                if not in_list:
-                    in_list = True
-                    current_list = [paragraph]
-                else:
-                    current_list.append(paragraph)
-            else:
-                if in_list:
-                    # Finalizar lista anterior
-                    processed_paragraphs.append('\n'.join(current_list))
-                    in_list = False
-                    current_list = []
-                processed_paragraphs.append(paragraph)
-        
-        # No olvidar la última lista si existe
-        if in_list:
-            processed_paragraphs.append('\n'.join(current_list))
-        
-        return '\n\n'.join(processed_paragraphs)

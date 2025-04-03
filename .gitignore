@@ -28,3 +28,6 @@ ocr_test.py
 test_section_logic.py
 prueba.md
 old_ocr.py
+test_summarizer_core.py
+prueba.txt
+prueba_summary.md

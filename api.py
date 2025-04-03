@@ -28,6 +28,7 @@ async def summarize(
     easy: bool = Form(False, description="Generate easy-to-understand summaries"),
     model: str = Form("gemini-2.0-flash-exp", description="LLM model to use for summarization"),
     caching: bool = Form(False, description="Enable caching for summarization"),
+    debug: bool = Form(False, description="Enable debug mode with detailed logging and diagnostics"),
 ):
     results = []
     for uploaded_file in files:
@@ -44,6 +45,7 @@ async def summarize(
                 easy=easy,
                 model=model,
                 caching=caching,
+                debug=debug,
             )
             sanitized_text, dev_text = await summarizer.summarize()
             results.append({
